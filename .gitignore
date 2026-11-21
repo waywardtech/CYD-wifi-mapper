@@ -1,0 +1,12 @@
+.pio/
+.vscode/
+__pycache__/
+*.pyc
+# generated at build time from web/index.html by tools/embed_web.py
+src/web_assets.h
+# built single-page app (tools/build_artifact.py)
+dist/
+# simulator output and mock SD card
+sim/out/
+mock_sd/
+.DS_Store

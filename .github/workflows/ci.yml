@@ -1,0 +1,39 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('platformio.ini') }}
+      - name: Install tools
+        run: pip install platformio pillow playwright ziglang
+      - name: Core unit tests (host)
+        run: pio test -e native
+      - name: Firmware builds (both CYD variants)
+        run: pio run -e cyd -e cyd2usb
+      - name: Simulator screenshots
+        run: sim/run.sh
+      - name: Setup web app, end to end in Chrome
+        run: python test/web/test_web.py
+      - name: Automatic floor plan tracing
+        run: python test/web/test_autotrace.py
+      - name: Browser build of the device app
+        run: python tools/build_artifact.py && python test/web/test_emulator.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-and-screens
+          path: |
+            .pio/build/cyd/firmware.bin
+            .pio/build/cyd2usb/firmware.bin
+            sim/out/*.png
+            dist/artifact.html

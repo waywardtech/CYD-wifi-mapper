@@ -1,0 +1,810 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CYD Wi-Fi Mapper</title>
+<style>
+  :root { --bg:#04090c; --panel:#081820; --line:#1d6b82; --wall:#46e1ff; --text:#c8ebf5; --muted:#6e96a5; --amber:#ffb400; --bad:#ff5a5a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header { display:flex; gap:12px; align-items:baseline; padding:10px 14px; border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { margin:0; font-size:17px; color:var(--wall); letter-spacing:.06em; }
+  header span { color:var(--muted); font-size:12px; }
+  main { padding:14px; max-width:980px; margin:0 auto; }
+  h2 { font-size:15px; color:var(--wall); margin:22px 0 8px; letter-spacing:.05em; text-transform:uppercase; }
+  p, li { color:var(--muted); } p b, li b { color:var(--text); font-weight:600; }
+  button, input, select { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:3px; padding:7px 10px; }
+  button { cursor:pointer; } button:hover { border-color:var(--wall); }
+  button.on { color:var(--amber); border-color:var(--amber); }
+  button.danger { color:var(--bad); border-color:#7a2d2d; }
+  input:focus, select:focus, button:focus-visible { outline:2px solid var(--wall); outline-offset:1px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0; }
+  .card { border:1px solid var(--line); background:var(--panel); padding:10px 12px; margin:8px 0; border-radius:3px; }
+  table { border-collapse:collapse; width:100%; } td, th { text-align:left; padding:6px 8px; border-bottom:1px solid #0f3542; vertical-align:middle; }
+  th { color:var(--muted); font-weight:400; font-size:12px; text-transform:uppercase; }
+  td input { width:100%; min-width:90px; }
+  .tablewrap { overflow-x:auto; }
+  canvas { display:block; width:100%; height:62vh; min-height:320px; border:1px solid var(--line); background:#000; touch-action:none; cursor:crosshair; }
+  #msg { color:var(--amber); min-height:1.4em; margin:6px 0; }
+  #dlg { position:fixed; inset:0; background:rgba(0,0,0,.72); display:flex; align-items:center; justify-content:center; padding:16px; z-index:10; }
+  #dlg > div { background:var(--panel); border:1px solid var(--wall); border-radius:4px; padding:16px; max-width:460px; width:100%; }
+  #dlg p { color:var(--text); white-space:pre-line; margin:0 0 12px; }
+  #dlg input { width:100%; margin-bottom:12px; }
+  code { color:var(--text); background:#0f2a35; padding:1px 5px; border-radius:3px; word-break:break-all; }
+  textarea { width:100%; height:7em; font:12px ui-monospace, Menlo, Consolas, monospace; color:var(--muted); background:#000; border:1px solid var(--line); }
+  label { color:var(--muted); font-size:12px; display:flex; flex-direction:column; gap:3px; }
+  .small { font-size:12px; }
+</style>
+</head>
+<body>
+<header><h1>CYD WI-FI MAPPER</h1><span id="status">connecting…</span></header>
+<main id="app"></main>
+<script>
+'use strict';
+/* CYD Wi-Fi Mapper — setup app. Served by the CYD at http://192.168.4.1 while HOTSPOT SETUP is open.
+   Everything here runs in the browser; the CYD only stores and returns small JSON files.
+   Away from a CYD (opened from disk, hosted on a web page, or published as a Claude artifact) it runs
+   standalone: scan sets are kept in the browser and exported as project.json for the SD card.
+   It must not use alert/confirm/prompt or assume downloads and storage work: sandboxed frames refuse them. */
+
+// ---------------------------------------------------------------- pure helpers (unit-tested in test/web)
+const KINDS = ['Router', 'Mesh node', 'Switch', 'Speaker', 'TV', 'Console', 'Other'];
+const EDIT_MPP = 0.02, EDIT_ORIGIN = 60;   // re-opened floors are drawn at 50 px per metre
+
+function slugify(name) {
+  return (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'scan-set';
+}
+
+// Floor name -> level. British convention: "first floor" is the one above ground. Editable afterwards.
+function inferLevel(name) {
+  const n = (name || '').toLowerCase();
+  if (/sub.?basement/.test(n)) return -2;
+  if (/basement|cellar|lower ground|lower level|downstairs/.test(n)) return -1;
+  if (/ground|main|garden|street/.test(n)) return 0;
+  const ord = [['first', 1], ['1st', 1], ['second', 2], ['2nd', 2], ['third', 3], ['3rd', 3], ['fourth', 4], ['4th', 4]];
+  for (const [k, v] of ord) if (n.includes(k)) return v;
+  if (/upstairs|upper/.test(n)) return 1;
+  if (/attic|loft/.test(n)) return 3;
+  const m = n.match(/-?\d+/);
+  return m ? parseInt(m[0], 10) : 0;
+}
+
+// "3.5", "3.5m", "350cm", "11ft 6in", "11' 6\"", "11.5 ft" -> metres (bare numbers are metres). null if unparseable.
+function parseLength(s) {
+  s = (s || '').trim().toLowerCase().replace(/,/g, '.');
+  if (!s) return null;
+  let m = s.match(/^(\d+(?:\.\d+)?)\s*(?:ft|feet|foot|')\s*(?:(\d+(?:\.\d+)?)\s*(?:in|inch|inches|")?)?$/);
+  if (m) return parseFloat(m[1]) * 0.3048 + (m[2] ? parseFloat(m[2]) * 0.0254 : 0);
+  m = s.match(/^(\d+(?:\.\d+)?)\s*(?:in|inch|inches|")$/);
+  if (m) return parseFloat(m[1]) * 0.0254;
+  m = s.match(/^(\d+(?:\.\d+)?)\s*(cm|mm|m|metres?|meters?)?$/);
+  if (!m) return null;
+  const v = parseFloat(m[1]);
+  return m[2] === 'cm' ? v / 100 : m[2] === 'mm' ? v / 1000 : v;
+}
+
+const r2 = v => Math.round(v * 100) / 100;
+
+// Editor state (pixels) -> floor geometry (metres, relative to the anchor point).
+function floorFromEditor(ed) {
+  if (!ed.mpp) throw new Error('Set the scale first: pick the Scale tool and tap two points a known distance apart.');
+  if (ed.outline.length < 3 && !ed.walls.length) throw new Error('Trace the outline (at least 3 corners) first.');
+  let a = ed.anchor;
+  if (!a) {
+    const xs = ed.outline.concat(ed.walls.flatMap(w => [[w[0], w[1]], [w[2], w[3]]]));
+    a = [Math.min(...xs.map(p => p[0])), Math.min(...xs.map(p => p[1]))];
+  }
+  const cx = x => r2((x - a[0]) * ed.mpp), cy = y => r2((y - a[1]) * ed.mpp);
+  return {
+    id: ed.id, name: ed.name, level: ed.level, height: r2(ed.height),
+    outline: ed.outline.map(p => [cx(p[0]), cy(p[1])]),
+    walls: ed.walls.map(w => [cx(w[0]), cy(w[1]), cx(w[2]), cy(w[3])]),
+  };
+}
+
+// Floor geometry (metres) -> editor state, so an existing floor can be adjusted without its image.
+function editorFromFloor(f) {
+  const px = v => v / EDIT_MPP + EDIT_ORIGIN;
+  return {
+    id: f.id, name: f.name, level: f.level, height: f.height || 2.5, img: null,
+    outline: (f.outline || []).map(p => [px(p[0]), px(p[1])]), closed: (f.outline || []).length >= 3,
+    walls: (f.walls || []).map(w => w.map(px)), chain: null, scale: [], mpp: EDIT_MPP, anchor: [EDIT_ORIGIN, EDIT_ORIGIN],
+  };
+}
+
+// samples.jsonl -> CSV, one row per (sample, access point). Honours {"undo":1} lines.
+function samplesToCsv(text, project) {
+  const samples = [];
+  for (const line of (text || '').split('\n')) {
+    if (!line.trim()) continue;
+    let s; try { s = JSON.parse(line); } catch (e) { continue; }
+    if (s.undo) samples.pop(); else if (s.p) samples.push(s);
+  }
+  const fname = id => ((project.floors || []).find(f => f.id === id) || {}).name || id;
+  const oname = mac => ((project.objects || []).find(o => (o.bssids || []).includes(mac)) || {}).name || '';
+  const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const rows = ['sample,time,floor,x_m,y_m,z_m,joined_bssid,joined_rssi,bssid,object,ssid,channel,rssi'];
+  samples.forEach((s, i) => (s.a || []).forEach(a => rows.push([i + 1, s.t || '', q(fname(s.f)), s.p[0], s.p[1], s.p[2],
+    s.c ? s.c[0] : '', s.c ? s.c[1] : '', a[0], q(oname(a[0])), q(a[3] || ''), a[2], a[1]].join(','))));
+  return { csv: rows.join('\n') + '\n', count: samples.length };
+}
+
+// Snap a tapped point: onto an existing corner if close; otherwise square it to the previous point
+// (when ortho is on) and line the free axis up with any existing corner that is nearly level with it.
+function snapPoint(p, verts, prev, ortho, tol) {
+  for (const v of verts) if (Math.hypot(v[0] - p[0], v[1] - p[1]) <= tol) return [v[0], v[1]];
+  let x = p[0], y = p[1], lockX = false, lockY = false;
+  if (ortho && prev) {
+    if (Math.abs(x - prev[0]) > Math.abs(y - prev[1])) { y = prev[1]; lockY = true; } else { x = prev[0]; lockX = true; }
+  }
+  if (ortho) {
+    let bx = tol, by = tol;
+    for (const v of verts) {
+      if (!lockX && Math.abs(v[0] - p[0]) <= bx) { bx = Math.abs(v[0] - p[0]); x = v[0]; }
+      if (!lockY && Math.abs(v[1] - p[1]) <= by) { by = Math.abs(v[1] - p[1]); y = v[1]; }
+    }
+  }
+  return [x, y];
+}
+
+// ---------------------------------------------------------------- automatic tracing of plan images
+// Input: greyscale pixels of a black-and-white floor plan. Output: for every separate plan found on
+// the sheet, its outline polygon and interior wall centre-lines, in pixel units.
+// Idea: walls are the thick strokes; text, door swings, dimension lines and fixtures are thin.
+function otsu(gray) {
+  const hist = new Uint32Array(256), n = gray.length;
+  for (let i = 0; i < n; i++) hist[gray[i]]++;
+  let sum = 0, sumB = 0, wB = 0, best = -1, thr = 127;
+  for (let i = 0; i < 256; i++) sum += i * hist[i];
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; if (!wB) continue;
+    const wF = n - wB; if (!wF) break;
+    sumB += i * hist[i];
+    const d = sumB / wB - (sum - sumB) / wF, v = wB * wF * d * d;
+    if (v > best) { best = v; thr = i; }
+  }
+  return Math.min(thr, 175);
+}
+
+// Length of the horizontal / vertical run of set pixels each pixel belongs to.
+function runLens(mask, w, h) {
+  const hr = new Uint16Array(w * h), vr = new Uint16Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w;) {
+    if (!mask[y * w + x]) { x++; continue; }
+    let e = x; while (e < w && mask[y * w + e]) e++;
+    hr.fill(Math.min(65535, e - x), y * w + x, y * w + e); x = e;
+  }
+  for (let x = 0; x < w; x++) for (let y = 0; y < h;) {
+    if (!mask[y * w + x]) { y++; continue; }
+    let e = y; while (e < h && mask[e * w + x]) e++;
+    const L = Math.min(65535, e - y); for (let k = y; k < e; k++) vr[k * w + x] = L; y = e;
+  }
+  return { hr, vr };
+}
+
+// 4-connected component labelling. lab[i] = 1-based component id (0 = background).
+function labelMask(mask, w, h) {
+  const lab = new Int32Array(w * h), q = new Int32Array(w * h), comps = [];
+  for (let s = 0; s < w * h; s++) {
+    if (!mask[s] || lab[s]) continue;
+    const c = { id: comps.length + 1, area: 0, x0: w, y0: h, x1: 0, y1: 0, first: s };
+    let head = 0, tail = 0; q[tail++] = s; lab[s] = c.id;
+    while (head < tail) {
+      const i = q[head++], x = i % w, y = (i - x) / w;
+      c.area++; if (x < c.x0) c.x0 = x; if (x > c.x1) c.x1 = x; if (y < c.y0) c.y0 = y; if (y > c.y1) c.y1 = y;
+      if (x > 0 && mask[i - 1] && !lab[i - 1]) { lab[i - 1] = c.id; q[tail++] = i - 1; }
+      if (x < w - 1 && mask[i + 1] && !lab[i + 1]) { lab[i + 1] = c.id; q[tail++] = i + 1; }
+      if (y > 0 && mask[i - w] && !lab[i - w]) { lab[i - w] = c.id; q[tail++] = i - w; }
+      if (y < h - 1 && mask[i + w] && !lab[i + w]) { lab[i + w] = c.id; q[tail++] = i + w; }
+    }
+    comps.push(c);
+  }
+  return { lab, comps };
+}
+
+// Close gaps between wall runs that line up along a row/column: door openings (short gaps next to a
+// wall running that way) and windows (any gap that thin ink spans). Only used to seal the outline.
+function bridgeGaps(W, ink, M, w, h, t, horiz) {
+  const U = horiz ? w : h, V = horiz ? h : w, g = 10 * t, long = 3 * t, at = (u, v) => horiz ? v * w + u : u * w + v;
+  for (let v = 0; v < V; v++) {
+    let ps = -1, pe = -1;
+    for (let u = 0; u < U;) {
+      if (!W[at(u, v)]) { u++; continue; }
+      let e = u; while (e < U && W[at(e, v)]) e++;
+      if (pe >= 0) {
+        const gap = u - pe;
+        let fill = gap <= g && (pe - ps >= long || e - u >= long);
+        if (!fill && gap <= 40 * t) { let c = 0; for (let k = pe; k < u; k++) c += ink[at(k, v)]; fill = c >= 0.9 * gap; }
+        if (fill) for (let k = pe; k < u; k++) M[at(k, v)] = 1;
+      }
+      ps = u; pe = e; u = e;
+    }
+  }
+}
+
+// Boundary of component `id` as a closed polygon along pixel edges (region kept on the right).
+function traceOutline(lab, w, h, id, first) {
+  const inside = (x, y) => x >= 0 && y >= 0 && x < w && y < h && lab[y * w + x] === id;
+  const right = (x, y, d) => d === 0 ? inside(x, y) : d === 1 ? inside(x - 1, y) : d === 2 ? inside(x - 1, y - 1) : inside(x, y - 1);
+  const left = (x, y, d) => d === 0 ? inside(x, y - 1) : d === 1 ? inside(x, y) : d === 2 ? inside(x - 1, y) : inside(x - 1, y - 1);
+  const DX = [1, 0, -1, 0], DY = [0, 1, 0, -1], sx = first % w, sy = (first - sx) / w, pts = [];
+  let x = sx, y = sy, d = 0, guard = 8 * (w + h) + 4 * w * h;
+  do {
+    for (const nd of [(d + 1) % 4, d, (d + 3) % 4, (d + 2) % 4]) {
+      if (right(x, y, nd) && !left(x, y, nd)) { if (nd !== d || !pts.length) pts.push([x, y]); d = nd; break; }
+    }
+    x += DX[d]; y += DY[d];
+  } while ((x !== sx || y !== sy) && --guard > 0);
+  return pts;
+}
+
+function distSeg(p, s) {
+  const dx = s[2] - s[0], dy = s[3] - s[1], l2 = dx * dx + dy * dy;
+  const t = l2 ? Math.max(0, Math.min(1, ((p[0] - s[0]) * dx + (p[1] - s[1]) * dy) / l2)) : 0;
+  return Math.hypot(p[0] - s[0] - t * dx, p[1] - s[1] - t * dy);
+}
+
+// Douglas-Peucker on a closed polygon.
+function simplifyClosed(P, eps) {
+  if (P.length < 5) return P;
+  let far = 0, fd = -1;
+  P.forEach((p, i) => { const d = Math.hypot(p[0] - P[0][0], p[1] - P[0][1]); if (d > fd) { fd = d; far = i; } });
+  const dp = pts => {
+    const keep = new Uint8Array(pts.length), stack = [[0, pts.length - 1]]; keep[0] = keep[pts.length - 1] = 1;
+    while (stack.length) {
+      const [a, b] = stack.pop(); let m = -1, md = eps; const s = [pts[a][0], pts[a][1], pts[b][0], pts[b][1]];
+      for (let i = a + 1; i < b; i++) { const d = distSeg(pts[i], s); if (d > md) { md = d; m = i; } }
+      if (m >= 0) { keep[m] = 1; stack.push([a, m], [m, b]); }
+    }
+    return pts.filter((_, i) => keep[i]);
+  };
+  const a = dp(P.slice(0, far + 1)), b = dp(P.slice(far).concat([P[0]]));
+  return a.concat(b.slice(1, -1));
+}
+
+// Make nearly horizontal / vertical edges exactly so and rebuild the corners where they meet.
+function squareUp(P, eps) {
+  let n = P.length; if (n < 4) return P;
+  const type = [], c = [];
+  for (let i = 0; i < n; i++) {
+    const a = P[i], b = P[(i + 1) % n], dx = Math.abs(b[0] - a[0]), dy = Math.abs(b[1] - a[1]);
+    type[i] = dy <= dx * 0.2 ? 'H' : dx <= dy * 0.2 ? 'V' : 'D';
+    c[i] = type[i] === 'H' ? (a[1] + b[1]) / 2 : (a[0] + b[0]) / 2;
+  }
+  for (let i = 0; i < n; i++) { const p = (i + n - 1) % n; if (type[i] !== 'D' && type[i] === type[p] && Math.abs(c[i] - c[p]) <= eps) c[i] = c[p] = (c[i] + c[p]) / 2; }
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const p = (i + n - 1) % n, tp = type[p], ti = type[i], v = P[i];
+    if (tp === 'H' && ti === 'V') out.push([c[i], c[p]]);
+    else if (tp === 'V' && ti === 'H') out.push([c[p], c[i]]);
+    else if (tp === ti && tp !== 'D') { if (c[p] !== c[i]) tp === 'H' ? out.push([v[0], c[p]], [v[0], c[i]]) : out.push([c[p], v[1]], [c[i], v[1]]); }
+    else out.push([tp === 'V' ? c[p] : ti === 'V' ? c[i] : v[0], tp === 'H' ? c[p] : ti === 'H' ? c[i] : v[1]]);
+  }
+  return out;
+}
+
+// Centre-lines of straight horizontal or vertical wall strokes inside footprint `id`.
+function wallLines(W, lab, w, h, id, t, horiz) {
+  const U = horiz ? w : h, V = horiz ? h : w, at = (u, v) => horiz ? v * w + u : u * w + v;
+  const minLen = Math.max(3 * t, 12), maxThick = 8 * t + 4, out = [];
+  let active = [];
+  const close = b => { const th = b.last - b.v0 + 1; if (th <= maxThick) { const m = (b.v0 + b.last + 1) / 2; out.push({ seg: horiz ? [b.u0, m, b.u1, m] : [m, b.u0, m, b.u1], th }); } };
+  for (let v = 0; v <= V; v++) {
+    const next = [];
+    if (v < V) for (let u = 0; u < U;) {
+      const i = at(u, v); if (!W[i] || lab[i] !== id) { u++; continue; }
+      let e = u; while (e < U && W[at(e, v)] && lab[at(e, v)] === id) e++;
+      if (e - u >= minLen) {
+        const b = active.find(k => Math.min(k.u1, e) - Math.max(k.u0, u) >= 0.5 * Math.min(k.u1 - k.u0, e - u));
+        if (b) { if (!b.hit) next.push(b); b.hit = true; b.u0 = Math.min(b.u0, u); b.u1 = Math.max(b.u1, e); b.last = v; }
+        else next.push({ u0: u, u1: e, v0: v, last: v, hit: true });
+      }
+      u = e;
+    }
+    active.filter(b => !b.hit).forEach(close);
+    next.forEach(b => { b.hit = false; });
+    active = next;
+  }
+  // one wall can come out as two overlapping strips where a crossing wall nicks it: keep the longer
+  const len = k => Math.abs(k.seg[2] - k.seg[0]) + Math.abs(k.seg[3] - k.seg[1]), lo = k => horiz ? k.seg[0] : k.seg[1], pos = k => horiz ? k.seg[1] : k.seg[0];
+  out.sort((a, b) => len(b) - len(a));
+  return out.filter((k, i) => !out.slice(0, i).some(m => Math.abs(pos(m) - pos(k)) <= (m.th + k.th) / 2 + t &&
+    Math.min(lo(m) + len(m), lo(k) + len(k)) - Math.max(lo(m), lo(k)) >= 0.8 * len(k)));
+}
+
+function plansFromWalls(ink, W, w, h, t) {
+  // drop text-sized blobs and any hollow frame drawn round the whole sheet
+  const wl = labelMask(W, w, h), drop = new Uint8Array(wl.comps.length + 1), edge = new Uint32Array(wl.comps.length + 1), m = 3 * t + 2;
+  for (let i = 0; i < w * h; i++) { const c = wl.lab[i]; if (!c) continue; const k = wl.comps[c - 1], x = i % w, y = (i - x) / w; if (x - k.x0 < m || k.x1 - x < m || y - k.y0 < m || k.y1 - y < m) edge[c]++; }
+  for (const k of wl.comps) {
+    const bw = k.x1 - k.x0 + 1, bh = k.y1 - k.y0 + 1;
+    if (Math.max(bw, bh) < Math.max(30, 6 * t)) drop[k.id] = 1;
+    else if (bw > 0.9 * w && bh > 0.9 * h && edge[k.id] >= 0.95 * k.area) drop[k.id] = 1;
+  }
+  for (let i = 0; i < w * h; i++) if (drop[wl.lab[i]]) W[i] = 0;
+
+  // seal openings, flood the outside from the sheet edge; whatever is not outside is a building
+  const M = Uint8Array.from(W);
+  bridgeGaps(W, ink, M, w, h, t, true); bridgeGaps(W, ink, M, w, h, t, false);
+  const out = new Uint8Array(w * h), q = new Int32Array(w * h); let head = 0, tail = 0;
+  const seed = i => { if (!M[i] && !out[i]) { out[i] = 1; q[tail++] = i; } };
+  for (let x = 0; x < w; x++) { seed(x); seed((h - 1) * w + x); }
+  for (let y = 0; y < h; y++) { seed(y * w); seed(y * w + w - 1); }
+  while (head < tail) { const i = q[head++], x = i % w; if (x > 0) seed(i - 1); if (x < w - 1) seed(i + 1); if (i >= w) seed(i - w); if (i < w * (h - 1)) seed(i + w); }
+  const F = new Uint8Array(w * h); for (let i = 0; i < w * h; i++) F[i] = out[i] ? 0 : 1;
+  const fl = labelMask(F, w, h), biggest = Math.max(0, ...fl.comps.map(c => c.area));
+  const plans = [];
+  for (const c of fl.comps) {
+    if (c.area < 0.15 * biggest || c.area < 0.004 * w * h) continue;
+    let eps = Math.max(1.5, 0.5 * t), outline;
+    do { outline = squareUp(simplifyClosed(traceOutline(fl.lab, w, h, c.id, c.first), eps), eps); eps *= 1.6; } while (outline.length > 120);
+    if (outline.length < 3) continue;
+    const edges = outline.map((p, i) => [p[0], p[1], outline[(i + 1) % outline.length][0], outline[(i + 1) % outline.length][1]]);
+    const walls = wallLines(W, fl.lab, w, h, c.id, t, true).concat(wallLines(W, fl.lab, w, h, c.id, t, false)).filter(k => {
+      let near = 0;  // exterior walls are already the outline: drop lines that hug it
+      for (let j = 0; j < 9; j++) { const f = (j + 0.5) / 9, p = [k.seg[0] + f * (k.seg[2] - k.seg[0]), k.seg[1] + f * (k.seg[3] - k.seg[1])]; if (edges.some(s => distSeg(p, s) <= k.th / 2 + t + 2)) near++; }
+      return near < 7;
+    }).map(k => k.seg).sort((a, b) => Math.hypot(b[2] - b[0], b[3] - b[1]) - Math.hypot(a[2] - a[0], a[3] - a[1])).slice(0, 160);
+    plans.push({ outline, walls, area: c.area, bbox: [c.x0, c.y0, c.x1 + 1, c.y1 + 1] });
+  }
+  return plans.sort((a, b) => a.bbox[0] - b.bbox[0] || a.bbox[1] - b.bbox[1]);
+}
+
+function detectPlan(gray, w, h) {
+  const n = w * h, thr = otsu(gray), ink = new Uint8Array(n);
+  let dark = 0; for (let i = 0; i < n; i++) if (gray[i] <= thr) { ink[i] = 1; dark++; }
+  if (dark > n / 2) { for (let i = 0; i < n; i++) ink[i] ^= 1; dark = n - dark; }  // white-on-black drawing
+  const good = p => p.length && p.reduce((a, c) => a + c.area, 0) >= 0.03 * n;
+  // Thin window lines fade to pale grey in small or blurry images. For sealing openings, count
+  // anything clearly darker than the paper as a line.
+  const hist = new Uint32Array(256); for (let i = 0; i < n; i++) hist[gray[i]]++;
+  let paper = 255; for (let v = 128; v < 256; v++) if (hist[v] > hist[paper]) paper = v;
+  const seal = new Uint8Array(n); for (let i = 0; i < n; i++) seal[i] = ink[i] || gray[i] < paper - 20 ? 1 : 0;
+
+  // thick strokes of `src`, with thickness taken from the thinner end of what is thick (interior walls)
+  const thick = src => {
+    const { hr, vr } = runLens(src, w, h), hist = new Uint32Array(256); let cnt = 0;
+    for (let i = 0; i < n; i++) if (src[i]) { const s = Math.min(hr[i], vr[i], 255); if (s >= 3) { hist[s]++; cnt++; } }
+    if (!cnt) return null;
+    let acc = 0, t = 3; for (let s = 3; s < 256; s++) { acc += hist[s]; if (acc >= 0.2 * cnt) { t = s; break; } }
+    const tmin = Math.max(3, Math.round(0.6 * t)), W = new Uint8Array(n);
+    for (let i = 0; i < n; i++) if (src[i] && Math.min(hr[i], vr[i]) >= tmin) W[i] = 1;
+    return { W, t, frac: cnt / Math.max(1, dark) };
+  };
+
+  // 1. walls drawn solid
+  let a = thick(ink);
+  if (a && a.frac >= 0.2) { const p = plansFromWalls(seal, a.W, w, h, a.t); if (good(p)) return { mode: 'solid', t: a.t, plans: p }; }
+
+  // 2. walls drawn as two thin parallel lines: fill the strip between them, then treat as solid
+  {
+    const { hr, vr } = runLens(ink, w, h), hist = new Float64Array(48);
+    const scan = (U, V, at, fn) => { for (let v = 0; v < V; v++) { let last = -1; for (let u = 0; u < U; u++) if (ink[at(u, v)]) { if (last >= 0 && u - last - 1 >= 2 && u - last - 1 < 48) fn(last, u, v); last = u; } } };
+    const atH = (u, v) => v * w + u, atV = (u, v) => u * w + v;
+    scan(w, h, atH, (a0, b0) => { hist[b0 - a0 - 1] += 1; }); scan(h, w, atV, (a0, b0) => { hist[b0 - a0 - 1] += 1; });
+    // widest strip width that is nearly as common as the commonest one (exterior walls are the widest)
+    let peak = 0, tw = 0; for (let s = 3; s < 48; s++) peak = Math.max(peak, hist[s]);
+    for (let s = 3; s < 48 && peak; s++) if (hist[s] >= 0.4 * peak) tw = s;
+    if (tw) {
+      // interior walls are often thinner than exterior ones, so fill every strip up to 1.5x the common
+      // width - but only between lines much longer than the strip is wide (lettering never is)
+      const filled = Uint8Array.from(ink), hi = Math.ceil(1.5 * tw), need = g => Math.max(4 * g, 24);
+      scan(w, h, atH, (a0, b0, v) => { const g = b0 - a0 - 1; if (g <= hi && vr[atH(a0, v)] >= need(g) && vr[atH(b0, v)] >= need(g)) for (let k = a0 + 1; k < b0; k++) filled[atH(k, v)] = 1; });
+      scan(h, w, atV, (a0, b0, v) => { const g = b0 - a0 - 1; if (g <= hi && hr[atV(a0, v)] >= need(g) && hr[atV(b0, v)] >= need(g)) for (let k = a0 + 1; k < b0; k++) filled[atV(k, v)] = 1; });
+      a = thick(filled);
+      if (a) { for (let i = 0; i < n; i++) if (filled[i]) seal[i] = 1; const p = plansFromWalls(seal, a.W, w, h, a.t); if (good(p)) return { mode: 'double-line', t: a.t, plans: p }; }
+    }
+  }
+
+  // 3. single-line sketch: every big connected line drawing counts as wall
+  {
+    const il = labelMask(ink, w, h), W = new Uint8Array(n), big = 0.25 * Math.min(w, h), keep = new Uint8Array(il.comps.length + 1);
+    for (const c of il.comps) if (Math.max(c.x1 - c.x0, c.y1 - c.y0) >= big) keep[c.id] = 1;
+    for (let i = 0; i < n; i++) if (keep[il.lab[i]]) W[i] = 1;
+    const p = plansFromWalls(seal, W, w, h, 2); if (good(p)) return { mode: 'single-line', t: 2, plans: p };
+  }
+  return { mode: 'none', t: 0, plans: [] };
+}
+
+function inPoly(poly, p) {
+  let c = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const a = poly[i], b = poly[j]; if ((a[1] > p[1]) !== (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0]) c = !c; }
+  return c;
+}
+
+globalThis.WM = { slugify, inferLevel, parseLength, floorFromEditor, editorFromFloor, samplesToCsv, snapPoint, detectPlan, distSeg, inPoly };
+
+// ---------------------------------------------------------------- device API (with offline fallback)
+let offline = false;
+const ls = k => 'wm:' + k;
+// Browser storage that never throws: falls back to memory when the frame has none.
+const mem = {};
+const store = {
+  get(k) { try { const v = localStorage.getItem(k); if (v != null) return v; } catch (e) {} return k in mem ? mem[k] : null; },
+  set(k, v) { mem[k] = v; try { localStorage.setItem(k, v); } catch (e) {} },
+  del(k) { delete mem[k]; try { localStorage.removeItem(k); } catch (e) {} },
+  keys() { const s = new Set(Object.keys(mem)); try { for (let i = 0; i < localStorage.length; i++) s.add(localStorage.key(i)); } catch (e) {} return [...s]; },
+};
+// Hand a generated file to the person: the artifact download capability if present, else a normal
+// browser download. Returns false if they declined. Always pair with a Copy button: either can be refused.
+async function saveFile(filename, text) {
+  try {
+    const d = globalThis.claude && await globalThis.claude.use('downloads');
+    if (d) { await d.save({ filename, data: text }); return true; }
+  } catch (e) { return false; }
+  const a = h('a', { href: URL.createObjectURL(new Blob([text], { type: 'application/octet-stream' })), download: filename });
+  document.body.append(a); a.click(); a.remove();
+  return true;
+}
+async function copyText(text, btn) {
+  try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied'; }
+  catch (e) { btn.textContent = 'Copy failed - select the text below'; }
+}
+const api = {
+  async state() {
+    try {
+      const r = await fetch('/api/state', { cache: 'no-store' });
+      if (!r.ok) throw 0;
+      return await r.json();
+    } catch (e) {
+      offline = true;
+      const projects = store.keys().filter(k => k.startsWith('wm:/wifimap/') && k.endsWith('/project.json')).map(k => k.split('/')[2]).sort();
+      return { version: 'offline', sd: true, wifi: '', projects };
+    }
+  },
+  async read(path) {
+    if (offline) return store.get(ls(path));
+    const r = await fetch('/api/file?path=' + encodeURIComponent(path), { cache: 'no-store' });
+    return r.ok ? r.text() : null;
+  },
+  async write(path, text) {
+    if (offline) { store.set(ls(path), text); return; }
+    const r = await fetch('/api/file?path=' + encodeURIComponent(path), { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: text });
+    if (!r.ok) throw new Error('The CYD could not save the file (is the SD card in?)');
+  },
+  async remove(path) {
+    if (offline) { store.keys().filter(k => k.startsWith(ls(path))).forEach(k => store.del(k)); return; }
+    await fetch('/api/delete?path=' + encodeURIComponent(path), { method: 'POST' });
+  },
+  async wifi(ssid, pass) {
+    if (offline) return;
+    await fetch('/api/wifi', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'ssid=' + encodeURIComponent(ssid) + '&pass=' + encodeURIComponent(pass) });
+  },
+};
+const ppath = slug => '/wifimap/' + slug + '/project.json';
+async function loadProject(slug) {
+  const t = await api.read(ppath(slug));
+  const p = t ? JSON.parse(t) : { v: 1, name: slug, floors: [], objects: [] };
+  p.floors = p.floors || []; p.objects = p.objects || [];
+  return p;
+}
+
+// ---------------------------------------------------------------- tiny DOM helpers
+const $ = sel => document.querySelector(sel);
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (k === 'class') e.className = v;
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? '' : v);
+  }
+  for (const k of kids.flat()) if (k != null) e.append(k.nodeType ? k : document.createTextNode(k));
+  return e;
+}
+function show(...nodes) { const a = $('#app'); a.replaceChildren(...nodes); window.scrollTo(0, 0); }
+// In-page dialogs (alert / confirm / prompt do nothing inside sandboxed frames).
+// Resolves: text input -> string or null, question -> true / false, notice -> true.
+function dialog(message, o) {
+  o = o || {};
+  return new Promise(done => {
+    const input = o.input ? h('input', { placeholder: o.placeholder || '', 'aria-label': 'Answer' }) : null;
+    const close = v => { box.remove(); done(v); };
+    const ok = h('button', { class: 'on ok', onclick: () => close(input ? input.value : true) }, o.ok || 'OK');
+    const box = h('div', { id: 'dlg', role: 'dialog', 'aria-modal': 'true' }, h('div', {}, h('p', {}, message), input,
+      h('div', { class: 'row' }, ok, o.cancel === null ? null : h('button', { class: 'cancel', onclick: () => close(input ? null : false) }, o.cancel || 'Cancel'))));
+    box.addEventListener('keydown', e => { if (e.key === 'Enter') ok.click(); else if (e.key === 'Escape') close(input ? null : o.cancel !== null ? false : true); });
+    document.body.append(box); (input || ok).focus();
+  });
+}
+const notify = m => dialog(m, { cancel: null });
+const sure = (m, ok) => dialog(m, { ok: ok || 'Yes' });
+const askText = (m, placeholder) => dialog(m, { input: true, placeholder });
+function fail(e) { notify(e.message || String(e)); }
+function readFileText(file) { return new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(String(r.result)); r.onerror = () => no(new Error('Could not read that file.')); r.readAsText(file); }); }
+
+// ---------------------------------------------------------------- home
+async function viewHome() {
+  const st = await api.state();
+  $('#status').textContent = offline ? 'standalone · not connected to a CYD' : 'connected · firmware ' + st.version + (st.sd ? '' : ' · NO SD CARD');
+  const imp = h('input', { type: 'file', accept: '.json,application/json', 'aria-label': 'Import project.json' });
+  imp.onchange = async () => {
+    try {
+      const p = JSON.parse(await readFileText(imp.files[0]));
+      if (!Array.isArray(p.floors)) throw new Error('That is not a scan set file (project.json).');
+      let slug = slugify(p.name), n = 2;
+      while (st.projects.includes(slug)) slug = slugify(p.name).slice(0, 28) + '-' + n++;
+      p.objects = p.objects || []; p.name = p.name || slug;
+      await api.write(ppath(slug), JSON.stringify(p)); viewProject(slug);
+    } catch (e) { fail(e); }
+  };
+  const name = h('input', { placeholder: 'e.g. Whole house, Office router test', size: 34, 'aria-label': 'New scan set name' });
+  const ssid = h('input', { value: st.wifi || '', placeholder: 'Home Wi-Fi name', 'aria-label': 'Home Wi-Fi name' });
+  const pass = h('input', { type: 'password', placeholder: 'password', 'aria-label': 'Home Wi-Fi password' });
+  show(
+    offline ? h('div', { class: 'card' }, h('p', {}, h('b', {}, 'Standalone mode. '), 'Prepare floor plans here, then export each scan set as ', h('code', {}, 'project.json'),
+      ' for the CYD. Scan sets are kept in this browser only and may not survive; the exported file is your copy.')) : null,
+    h('h2', {}, 'Scan sets'),
+    h('p', {}, 'A scan set is one survey project: its floor plans, the things you placed, and every measurement. Make a separate one for a single room if you want to test moving a router without redoing the whole house.'),
+    ...st.projects.map(s => h('div', { class: 'card row' }, h('b', {}, s), h('button', { onclick: () => viewProject(s) }, 'Open'))),
+    st.projects.length ? null : h('p', {}, 'None yet.'),
+    h('div', { class: 'row' }, name, h('button', { onclick: async () => {
+      if (!name.value.trim()) return name.focus();
+      const slug = slugify(name.value);
+      if (st.projects.includes(slug)) return notify('A scan set with that name already exists.');
+      try { await api.write(ppath(slug), JSON.stringify({ v: 1, name: name.value.trim(), floors: [], objects: [] })); viewProject(slug); } catch (e) { fail(e); }
+    } }, 'Create scan set')),
+    h('div', { class: 'row' }, h('label', {}, 'Or import a scan set (project.json) prepared elsewhere', imp)),
+    ...(offline ? [] : [h('h2', {}, 'Home Wi-Fi (optional)'),
+    h('p', {}, 'If you give the CYD your Wi-Fi name and password, each measurement also records ', h('b', {}, 'which mesh node it joined'), ' from that spot. Without it you still get signal strength for every access point. The CYD only hears 2.4 GHz.'),
+    h('div', { class: 'row' }, ssid, pass, h('button', { onclick: async () => { await api.wifi(ssid.value, pass.value); notify('Saved on the CYD.'); } }, 'Save'))]),
+  );
+}
+
+// ---------------------------------------------------------------- project
+async function viewProject(slug) {
+  let p;
+  try { p = await loadProject(slug); } catch (e) { return fail(e); }
+  const save = async () => { try { await api.write(ppath(slug), JSON.stringify(p)); } catch (e) { fail(e); } };
+  const sorted = p.floors.slice().sort((a, b) => b.level - a.level);
+  const fname = id => (p.floors.find(f => f.id === id) || {}).name || '?';
+  const newName = h('input', { placeholder: 'e.g. Ground floor, Basement, First floor', size: 34, 'aria-label': 'New floor name' });
+  const addFloor = () => {
+    const nm = newName.value.trim();
+    if (!nm) return newName.focus();
+    const id = Math.max(0, ...p.floors.map(f => f.id)) + 1;
+    viewEditor(slug, { id, name: nm, level: inferLevel(nm), height: 2.5, img: null, outline: [], closed: false, walls: [], chain: null, scale: [], mpp: null, anchor: null });
+  };
+  const sampIn = h('input', { type: 'file', accept: '.jsonl,.json,.txt', 'aria-label': 'Import samples.jsonl' });
+  sampIn.onchange = async () => {
+    try { const t = await readFileText(sampIn.files[0]); await api.write('/wifimap/' + slug + '/samples.jsonl', t); notify(samplesToCsv(t, p).count + ' measurements imported. Download CSV to use them.'); } catch (e) { fail(e); }
+  };
+  const exportSection = () => {
+    const json = JSON.stringify(p), ta = h('textarea', { readonly: true, 'aria-label': 'project.json contents' }, json);
+    const copy = h('button', { onclick: () => copyText(json, copy) }, 'Copy JSON');
+    return [h('h2', {}, 'Put it on the CYD'),
+      h('p', {}, 'Either save the file to the microSD card as ', h('code', {}, ppath(slug)), ', or open HOTSPOT SETUP on the CYD and use ', h('b', {}, 'import a scan set'), ' on its page.'),
+      h('div', { class: 'row' }, h('button', { class: 'on', onclick: async () => { if (!p.floors.length) return notify('Add a floor first.'); await saveFile('project.json', json); } }, 'Download project.json'), copy),
+      ta];
+  };
+  const objRows = p.objects.map((o, i) => {
+    const nm = h('input', { value: o.name, 'aria-label': 'Name' });
+    const bs = h('input', { value: (o.bssids || []).join(', '), placeholder: 'aa:bb:cc:dd:ee:ff', 'aria-label': 'BSSIDs' });
+    nm.onchange = () => { o.name = nm.value.trim() || o.name; save(); };
+    bs.onchange = () => { o.bssids = bs.value.toLowerCase().split(/[\s,]+/).filter(x => /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(x)); bs.value = o.bssids.join(', '); save(); };
+    return h('tr', {}, h('td', {}, nm), h('td', {}, KINDS[o.kind] || 'Other'), h('td', {}, fname(o.floor)), h('td', {}, o.z + ' m'), h('td', {}, bs),
+      h('td', {}, h('button', { class: 'danger', 'aria-label': 'Delete ' + o.name, onclick: async () => { if (await sure('Delete ' + o.name + '?', 'Delete')) { p.objects.splice(i, 1); await save(); viewProject(slug); } } }, '✕')));
+  });
+  show(
+    h('div', { class: 'row' }, h('button', { onclick: viewHome }, '‹ Scan sets'), h('b', {}, p.name)),
+    h('h2', {}, 'Floors'),
+    sorted.length ? h('div', { class: 'tablewrap' }, h('table', {}, h('tr', {}, h('th', {}, 'Floor'), h('th', {}, 'Level'), h('th', {}, 'Traced'), h('th', {}, '')),
+      ...sorted.map(f => h('tr', {}, h('td', {}, f.name), h('td', {}, String(f.level)), h('td', {}, f.outline.length + ' corners, ' + f.walls.length + ' walls'),
+        h('td', {}, h('div', { class: 'row' }, h('button', { onclick: () => viewEditor(slug, editorFromFloor(f)) }, 'Edit'),
+          h('button', { class: 'danger', onclick: async () => {
+            if (!await sure('Delete ' + f.name + ' and everything placed on it? Measurements taken there stay in the file but will no longer be shown.', 'Delete')) return;
+            p.floors = p.floors.filter(x => x.id !== f.id); p.objects = p.objects.filter(o => o.floor !== f.id); await save(); viewProject(slug);
+          } }, 'Delete'))))))) : h('p', {}, 'No floors yet. Add the first one below — you will trace its walls over your floor plan image.'),
+    h('div', { class: 'row' }, newName, h('button', { onclick: addFloor }, 'Add floor')),
+    h('p', { class: 'small' }, 'Levels are worked out from the name (basement −1, ground 0, first 1 …) and can be changed in the editor.'),
+    h('h2', {}, 'Placed objects'),
+    p.objects.length ? h('div', { class: 'tablewrap' }, h('table', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Type'), h('th', {}, 'Floor'), h('th', {}, 'Height'), h('th', {}, 'Radios (BSSID)'), h('th', {}, '')), ...objRows))
+      : h('p', {}, 'Routers, mesh nodes and other devices are placed on the CYD itself (PLACE mode). They appear here so you can give them proper names.'),
+    ...(offline ? exportSection() : []),
+    h('h2', {}, 'Measurements'),
+    offline ? h('div', { class: 'row' }, h('label', {}, 'Import samples.jsonl from the SD card', sampIn)) : null,
+    h('div', { class: 'row' }, h('button', { onclick: async () => {
+      const { csv, count } = samplesToCsv(await api.read('/wifimap/' + slug + '/samples.jsonl'), p);
+      if (!count) return notify(offline ? 'No measurements here yet. Import samples.jsonl from the SD card first.' : 'No measurements recorded yet.');
+      await saveFile(slug + '-samples.csv', csv);
+    } }, 'Download CSV')),
+    h('h2', {}, 'Danger zone'),
+    h('div', { class: 'row' }, h('button', { class: 'danger', onclick: async () => { if (await sure('Delete the scan set "' + p.name + '" and all its measurements?', 'Delete')) { await api.remove('/wifimap/' + slug); viewHome(); } } }, 'Delete this scan set')),
+  );
+}
+
+// ---------------------------------------------------------------- floor editor
+function viewEditor(slug, ed) {
+  let tool = ed.closed ? 'wall' : 'outline', ortho = true, zoom = 1, ox = 0, oy = 0;
+  const history = [];
+  const cv = h('canvas', { 'aria-label': 'Floor plan tracing area' }), msg = h('div', { id: 'msg', role: 'status' });
+  const ctx = cv.getContext('2d');
+  const snap = () => JSON.stringify({ outline: ed.outline, closed: ed.closed, walls: ed.walls, chain: ed.chain, scale: ed.scale, mpp: ed.mpp, anchor: ed.anchor });
+  const push = () => { history.push(snap()); if (history.length > 200) history.shift(); };
+  const say = t => { msg.textContent = t; };
+  let cands = [], scaleKey = null;
+  const hint = () => say({
+    pick: 'This sheet shows ' + cands.length + ' plans. Tap the one that is "' + ed.name + '".',
+    erase: 'Erase: tap a wall to remove it, or an outline corner to remove that corner.',
+    outline: ed.closed ? 'Outline closed. Use Walls for interior walls.' : 'Outline: tap each outside corner in turn, then tap the first corner again to close.',
+    wall: 'Walls: tap the start, then each bend. Press "Break" to start a separate wall.',
+    scale: 'Scale: tap two points a known distance apart (a long wall is best).',
+    anchor: 'Align: tap a spot that is in the same place on every floor (e.g. a stairwell corner) so floors stack correctly.',
+  }[tool] + (ed.mpp ? '' : '  ⚠ Scale not set yet.'));
+
+  const toScr = p => [(p[0] - ox) * zoom, (p[1] - oy) * zoom];
+  const toImg = (x, y) => [x / zoom + ox, y / zoom + oy];
+  function fit() {
+    const pts = ed.outline.concat(ed.walls.flatMap(w => [[w[0], w[1]], [w[2], w[3]]]));
+    let x0 = 0, y0 = 0, x1 = 600, y1 = 400;
+    if (ed.img) { x1 = ed.img.width; y1 = ed.img.height; }
+    else if (pts.length) { x0 = Math.min(...pts.map(p => p[0])) - 40; y0 = Math.min(...pts.map(p => p[1])) - 40; x1 = Math.max(...pts.map(p => p[0])) + 40; y1 = Math.max(...pts.map(p => p[1])) + 40; }
+    zoom = Math.min(cv.width / (x1 - x0), cv.height / (y1 - y0)); ox = x0; oy = y0;
+  }
+  function draw() {
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cv.width, cv.height);
+    if (ed.img) { ctx.globalAlpha = 0.55; ctx.drawImage(ed.img, -ox * zoom, -oy * zoom, ed.img.width * zoom, ed.img.height * zoom); ctx.globalAlpha = 1; }
+    ctx.lineWidth = 2 * dpr;
+    const path = (pts, close, colour) => { if (!pts.length) return; ctx.strokeStyle = colour; ctx.beginPath(); pts.forEach((p, i) => { const s = toScr(p); i ? ctx.lineTo(s[0], s[1]) : ctx.moveTo(s[0], s[1]); }); if (close) ctx.closePath(); ctx.stroke(); };
+    const dot = (p, colour, r) => { const s = toScr(p); ctx.fillStyle = colour; ctx.beginPath(); ctx.arc(s[0], s[1], (r || 4) * dpr, 0, 7); ctx.fill(); };
+    path(ed.outline, ed.closed, '#46e1ff'); ed.outline.forEach(p => dot(p, '#46e1ff'));
+    ed.walls.forEach(w => path([[w[0], w[1]], [w[2], w[3]]], false, '#ffb400'));
+    if (ed.chain) dot(ed.chain, '#ffb400', 5);
+    if (ed.scale.length) { path(ed.scale, false, '#ff46ff'); ed.scale.forEach(p => dot(p, '#ff46ff')); }
+    if (tool === 'pick') { ctx.setLineDash([8 * dpr, 6 * dpr]); cands.forEach(c => path(c.outline, true, '#3cdc5a')); ctx.setLineDash([]); }
+    if (ed.anchor) { const s = toScr(ed.anchor); ctx.strokeStyle = '#3cdc5a'; ctx.beginPath(); ctx.moveTo(s[0] - 12 * dpr, s[1]); ctx.lineTo(s[0] + 12 * dpr, s[1]); ctx.moveTo(s[0], s[1] - 12 * dpr); ctx.lineTo(s[0], s[1] + 12 * dpr); ctx.stroke(); }
+  }
+  function resize() { const r = cv.getBoundingClientRect(), d = window.devicePixelRatio || 1; cv.width = Math.round(r.width * d); cv.height = Math.round(r.height * d); draw(); }
+
+  function tapAt(p) {
+    const verts = ed.outline.concat(ed.walls.flatMap(w => [[w[0], w[1]], [w[2], w[3]]]));
+    const tol = 12 * (window.devicePixelRatio || 1) / zoom;
+    if (tool === 'pick') {
+      const i = cands.findIndex(c => inPoly(c.outline, p));
+      if (i >= 0) applyTrace(cands[i]);
+      return;
+    }
+    if (tool === 'erase') {
+      let bi = -1, bd = tol;
+      ed.walls.forEach((w, i) => { const d = distSeg(p, w); if (d < bd) { bd = d; bi = i; } });
+      if (bi >= 0) { push(); ed.walls.splice(bi, 1); }
+      else {
+        const vi = ed.outline.findIndex(v => Math.hypot(v[0] - p[0], v[1] - p[1]) <= tol);
+        if (vi >= 0 && ed.outline.length > 3) { push(); ed.outline.splice(vi, 1); }
+      }
+      return draw();
+    }
+    if (tool === 'outline') {
+      if (ed.closed) return hint();
+      if (ed.outline.length >= 3 && Math.hypot(ed.outline[0][0] - p[0], ed.outline[0][1] - p[1]) <= tol) { push(); ed.closed = true; tool = 'wall'; renderTools(); }
+      else { push(); ed.outline.push(snapPoint(p, verts, ed.outline[ed.outline.length - 1], ortho, tol)); }
+    } else if (tool === 'wall') {
+      const q = snapPoint(p, verts, ed.chain, ortho, tol);
+      push();
+      if (ed.chain) ed.walls.push([ed.chain[0], ed.chain[1], q[0], q[1]]);
+      ed.chain = q;
+    } else if (tool === 'scale') {
+      push();
+      if (ed.scale.length >= 2) ed.scale = [];
+      ed.scale.push(snapPoint(p, verts, null, false, tol));
+      if (ed.scale.length === 2) {
+        draw();
+        askText('Real distance between those two points?\nExamples: 4.2m   13ft 6in   420cm', 'e.g. 4.2m').then(ans => {
+          const len = parseLength(ans), d = Math.hypot(ed.scale[1][0] - ed.scale[0][0], ed.scale[1][1] - ed.scale[0][1]);
+          if (len && d > 1) { ed.mpp = len / d; store.set(scaleKey || 'wm:scale:last', String(ed.mpp)); say('Scale set: the two points are ' + r2(len) + ' m apart.'); }
+          else { ed.scale = []; say('Could not read that distance - try again.'); }
+          draw();
+        });
+        return;
+      }
+    } else if (tool === 'anchor') { push(); ed.anchor = snapPoint(p, verts, null, false, tol); }
+    hint(); draw();
+  }
+
+  // Automatic tracing: find the walls in the loaded image. Runs entirely in the browser.
+  function applyTrace(c) {
+    push();
+    Object.assign(ed, { outline: c.outline, closed: true, walls: c.walls, chain: null, anchor: null });
+    cands = []; tool = ed.mpp ? 'wall' : 'scale'; renderTools(); draw();
+    say('Traced automatically: ' + c.outline.length + ' corners, ' + c.walls.length + ' interior walls. Check it against the plan (Erase removes strays, Walls adds missing ones). '
+      + (ed.mpp ? 'Scale reused from the last floor on this sheet.' : 'Next: Scale - tap two points a known distance apart, e.g. across a room whose size is printed on the plan.'));
+  }
+  function autoTrace() {
+    if (!ed.img) return say('Load the floor plan image first.');
+    say('Finding walls…');
+    setTimeout(() => {
+      try {
+        const k = Math.min(2.5, 1800 / Math.max(ed.img.width, ed.img.height));
+        const cw = Math.max(1, Math.round(ed.img.width * k)), ch = Math.max(1, Math.round(ed.img.height * k));
+        const oc = document.createElement('canvas'); oc.width = cw; oc.height = ch;
+        const c2 = oc.getContext('2d', { willReadFrequently: true });
+        c2.fillStyle = '#fff'; c2.fillRect(0, 0, cw, ch); c2.drawImage(ed.img, 0, 0, cw, ch);
+        const d = c2.getImageData(0, 0, cw, ch).data, gray = new Uint8Array(cw * ch);
+        for (let i = 0; i < cw * ch; i++) gray[i] = (d[4 * i] * 77 + d[4 * i + 1] * 150 + d[4 * i + 2] * 29) >> 8;
+        const res = detectPlan(gray, cw, ch);
+        cands = res.plans.map(c => ({ outline: c.outline.map(q => [q[0] / k, q[1] / k]), walls: c.walls.map(q => q.map(v => v / k)) }));
+        if (!cands.length) { say('Could not find walls automatically in this image. Trace it by hand: start with Outline.'); return; }
+        if (cands.length === 1) return applyTrace(cands[0]);
+        tool = 'pick'; renderTools(); hint(); draw();
+      } catch (e) { say('Automatic tracing failed (' + e.message + '). Trace it by hand: start with Outline.'); }
+    }, 30);
+  }
+
+  // pointer handling: a short tap uses the tool, a drag pans, wheel / pinch-buttons zoom
+  let down = null;
+  const pos = e => { const r = cv.getBoundingClientRect(), d = window.devicePixelRatio || 1; return [(e.clientX - r.left) * d, (e.clientY - r.top) * d]; };
+  cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); const p = pos(e); down = { x: p[0], y: p[1], ox, oy, moved: false }; });
+  cv.addEventListener('pointermove', e => { if (!down) return; const p = pos(e); if (Math.hypot(p[0] - down.x, p[1] - down.y) > 8 * (window.devicePixelRatio || 1)) down.moved = true; if (down.moved) { ox = down.ox - (p[0] - down.x) / zoom; oy = down.oy - (p[1] - down.y) / zoom; draw(); } });
+  cv.addEventListener('pointerup', e => { if (!down) return; const p = pos(e), was = down; down = null; if (!was.moved) tapAt(toImg(p[0], p[1])); });
+  const zoomBy = (f, sx, sy) => { const c = toImg(sx, sy); zoom *= f; ox = c[0] - sx / zoom; oy = c[1] - sy / zoom; draw(); };
+  cv.addEventListener('wheel', e => { e.preventDefault(); const p = pos(e); zoomBy(e.deltaY < 0 ? 1.15 : 1 / 1.15, p[0], p[1]); }, { passive: false });
+
+  const nameIn = h('input', { value: ed.name }), levelIn = h('input', { type: 'number', value: ed.level, style: 'width:5em' }), heightIn = h('input', { value: ed.height + 'm', style: 'width:6em' });
+  nameIn.onchange = () => { ed.name = nameIn.value.trim() || ed.name; };
+  levelIn.onchange = () => { ed.level = parseInt(levelIn.value, 10) || 0; };
+  heightIn.onchange = () => { const v = parseLength(heightIn.value); if (v && v >= 1.5 && v <= 6) ed.height = v; heightIn.value = r2(ed.height) + 'm'; };
+  const file = h('input', { type: 'file', accept: 'image/*', 'aria-label': 'Floor plan image' });
+  file.onchange = () => {
+    const f = file.files[0]; if (!f) return;
+    const img = new Image();
+    img.onload = () => {
+      ed.img = img; fit(); draw();
+      if (ed.outline.length || ed.walls.length) return say('Image loaded behind the existing tracing - they may not line up. Auto-trace replaces the tracing.');
+      scaleKey = 'wm:scale:' + f.name + ':' + f.size;
+      { const m = parseFloat(store.get(scaleKey)); if (m > 0 && !ed.mpp) ed.mpp = m; }
+      autoTrace();
+    };
+    img.onerror = () => notify('That file could not be read as an image. Export or screenshot the plan as PNG or JPG first.');
+    img.src = URL.createObjectURL(f);
+  };
+  const tools = h('div', { class: 'row' });
+  function renderTools() {
+    const tb = (id, label) => h('button', { class: tool === id ? 'on' : '', 'aria-pressed': tool === id, onclick: () => { tool = id; ed.chain = null; renderTools(); hint(); draw(); } }, label);
+    tools.replaceChildren(
+      h('button', { onclick: autoTrace }, 'Auto-trace'),
+      tb('outline', 'Outline'), tb('scale', 'Scale'), tb('wall', 'Walls'), tb('erase', 'Erase'), tb('anchor', 'Align'),
+      h('button', { onclick: () => { ed.chain = null; draw(); } }, 'Break'),
+      h('button', { class: ortho ? 'on' : '', 'aria-pressed': ortho, onclick: () => { ortho = !ortho; renderTools(); } }, 'Square snap'),
+      h('button', { onclick: () => { const s = history.pop(); if (s) { Object.assign(ed, JSON.parse(s)); draw(); hint(); } } }, 'Undo'),
+      h('button', { 'aria-label': 'Zoom out', onclick: () => zoomBy(1 / 1.3, cv.width / 2, cv.height / 2) }, '−'),
+      h('button', { 'aria-label': 'Zoom in', onclick: () => zoomBy(1.3, cv.width / 2, cv.height / 2) }, '+'),
+      h('button', { onclick: () => { fit(); draw(); } }, 'Fit'),
+    );
+  }
+  const rect = async () => {
+    const m = (await askText('Room size as width x depth.\nExamples: 4m x 3m   13ft x 10ft', 'e.g. 4m x 3m') || '').split(/x|×|by/i);
+    const w = parseLength(m[0]), d = parseLength(m[1]);
+    if (!w || !d) return;
+    push();
+    const o = EDIT_ORIGIN, W = w / EDIT_MPP, D = d / EDIT_MPP;
+    Object.assign(ed, { outline: [[o, o], [o + W, o], [o + W, o + D], [o, o + D]], closed: true, walls: [], chain: null, scale: [], mpp: EDIT_MPP, anchor: [o, o], img: null });
+    tool = 'wall'; renderTools(); fit(); draw(); hint();
+  };
+  const saveFloor = async () => {
+    try {
+      if (ed.outline.length >= 3 && !ed.closed) ed.closed = true;
+      const floor = floorFromEditor(ed);
+      const p = await loadProject(slug);   // re-read so objects placed on the CYD meanwhile are kept
+      const i = p.floors.findIndex(f => f.id === floor.id);
+      if (i >= 0) p.floors[i] = floor; else p.floors.push(floor);
+      await api.write(ppath(slug), JSON.stringify(p));
+      viewProject(slug);
+    } catch (e) { fail(e); }
+  };
+  show(
+    h('div', { class: 'row' }, h('button', { onclick: async () => { if (!history.length || await sure('Leave without saving this floor?', 'Leave')) viewProject(slug); } }, '‹ Back'),
+      h('label', {}, 'Floor name', nameIn), h('label', {}, 'Level', levelIn), h('label', {}, 'Wall height', heightIn)),
+    h('div', { class: 'row' }, h('label', {}, 'Floor plan image (PNG / JPG) - walls are traced automatically', file), h('button', { onclick: rect }, 'Or: simple rectangle…'),
+      h('button', { class: 'on', onclick: saveFloor }, 'Save floor to CYD')),
+    tools, msg, cv,
+    h('p', { class: 'small' }, 'The image never leaves your browser — only the traced lines are sent to the CYD. Drag to move the plan, scroll or use − / + to zoom. Automatic tracing finds straight horizontal and vertical walls; add angled ones with Walls. If a sheet shows several floors, load the same image for each floor and tap the one you want.'),
+  );
+  renderTools(); resize(); fit(); draw(); hint();
+  window.onresize = () => { if (document.body.contains(cv)) resize(); };
+}
+
+if (typeof document !== 'undefined') viewHome().catch(fail);
+</script>
+</body>
+</html>
